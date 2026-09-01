@@ -1,9 +1,6 @@
-name = "bertho-ai-code"
+name = "bertho-ai-search"
 main = "src/index.js"
 compatibility_date = "2026-08-25"
 
 [vars]
 ENVIRONMENT = "production"
-
-[ai]
-binding = "AI"
