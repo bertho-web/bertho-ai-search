@@ -1,6 +1,6 @@
 /**
  * bertho-ai-search/src/index.js
- * Microservice de Recherche Web en Temps Réel & Extraction d'Actualités.
+ * Microservice de Recherche Web en Temps Réel.
  *
  * Architecture :
  * 1. DuckDuckGo HTML
@@ -8,6 +8,11 @@
  * 3. Wikipedia API
  *
  * Aucun appel à Workers AI.
+ *
+ * Principe :
+ * Le microservice exécute une intention de recherche reçue.
+ * Il ne tente pas de deviner l'intention utilisateur à partir
+ * de simples mots-clés.
  */
 
 const corsHeaders = {
@@ -17,6 +22,10 @@ const corsHeaders = {
 };
 
 const MAX_RESULTS = 5;
+
+/* ============================================================
+   UTILITAIRES
+   ============================================================ */
 
 function json(data, status = 200) {
   return Response.json(data, {
@@ -28,16 +37,29 @@ function json(data, status = 200) {
   });
 }
 
-function cleanText(value = "") {
+function decodeHtmlEntities(value = "") {
   return String(value)
-    .replace(/<[^>]+>/g, " ")
     .replace(/&nbsp;/gi, " ")
     .replace(/&amp;/gi, "&")
     .replace(/&quot;/gi, '"')
     .replace(/&#39;/gi, "'")
     .replace(/&#x27;/gi, "'")
+    .replace(/&apos;/gi, "'")
     .replace(/&lt;/gi, "<")
     .replace(/&gt;/gi, ">")
+    .replace(/&#(\d+);/g, (_, code) =>
+      String.fromCharCode(Number(code))
+    )
+    .replace(/&#x([0-9a-f]+);/gi, (_, code) =>
+      String.fromCharCode(parseInt(code, 16))
+    );
+}
+
+function cleanText(value = "") {
+  return decodeHtmlEntities(String(value))
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -49,52 +71,82 @@ function isValidUrl(value) {
 
   try {
     const parsed = new URL(value);
-    return parsed.protocol === "http:" || parsed.protocol === "https:";
+
+    return (
+      parsed.protocol === "http:" ||
+      parsed.protocol === "https:"
+    );
   } catch {
     return false;
   }
 }
 
-function decodeHtmlEntities(value = "") {
-  return value
-    .replace(/&amp;/gi, "&")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
-    .replace(/&#x27;/gi, "'")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&#(\d+);/g, (_, code) =>
-      String.fromCharCode(Number(code))
-    )
-    .replace(/&#x([0-9a-f]+);/gi, (_, code) =>
-      String.fromCharCode(parseInt(code, 16))
-    );
-}
-
 function normalizeUrl(rawUrl = "") {
-  let value = decodeHtmlEntities(rawUrl.trim());
+  const value = decodeHtmlEntities(
+    String(rawUrl).trim()
+  );
 
   if (!value) {
     return null;
   }
 
-  // URL absolue
   if (isValidUrl(value)) {
     return value;
   }
 
-  // Certaines réponses DuckDuckGo utilisent des URLs relatives.
   if (value.startsWith("//")) {
     const candidate = `https:${value}`;
     return isValidUrl(candidate) ? candidate : null;
   }
 
   if (value.startsWith("/")) {
-    const candidate = `https://html.duckduckgo.com${value}`;
-    return isValidUrl(candidate) ? candidate : null;
+    const candidate =
+      `https://html.duckduckgo.com${value}`;
+
+    return isValidUrl(candidate)
+      ? candidate
+      : null;
   }
 
   return null;
+}
+
+function normalizeIntent(body = {}) {
+  const intent =
+    typeof body.intent === "string"
+      ? body.intent.trim()
+      : null;
+
+  const objective =
+    typeof body.objective === "string"
+      ? body.objective.trim()
+      : null;
+
+  const freshness =
+    typeof body.freshness === "string"
+      ? body.freshness.trim().toLowerCase()
+      : "any";
+
+  const sourceType =
+    typeof body.sourceType === "string"
+      ? body.sourceType.trim().toLowerCase()
+      : "web";
+
+  return {
+    intent: intent || "web_search",
+    objective: objective || null,
+    freshness,
+    sourceType
+  };
+}
+
+function isNewsSearch(intent) {
+  return (
+    intent.sourceType === "news" ||
+    intent.freshness === "recent" ||
+    intent.freshness === "today" ||
+    intent.freshness === "latest"
+  );
 }
 
 /* ============================================================
@@ -112,61 +164,45 @@ async function searchDuckDuckGo(query) {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
       "Accept":
         "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8"
+      "Accept-Language":
+        "fr-FR,fr;q=0.9,en;q=0.8"
     }
   });
 
   if (!response.ok) {
-    throw new Error(`DuckDuckGo HTTP ${response.status}`);
+    throw new Error(
+      `DuckDuckGo HTTP ${response.status}`
+    );
   }
 
   const html = await response.text();
 
   if (!html || html.length < 500) {
-    throw new Error("DuckDuckGo returned an empty or invalid response");
+    throw new Error(
+      "DuckDuckGo returned an empty or invalid response"
+    );
   }
-
-  /*
-   * Structure généralement rencontrée :
-   *
-   * <div class="result">
-   *   <a class="result__a" href="...">Titre</a>
-   *   ...
-   *   <a class="result__snippet">Snippet</a>
-   * </div>
-   *
-   * On associe titre + URL + snippet à l'intérieur
-   * du même bloc de résultat afin d'éviter les décalages.
-   */
-
-  const blocks = html.match(
-    /<div[^>]+class=["'][^"']*\bresult\b[^"']*["'][\s\S]*?<\/div>\s*<\/div>/gi
-  ) || [];
 
   const results = [];
 
-  for (const block of blocks) {
+  /*
+   * Premier parsing :
+   * on récupère les liens result__a.
+   */
+
+  const titleMatches = [
+    ...html.matchAll(
+      /<a[^>]+class=["'][^"']*\bresult__a\b[^"']*["'][^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi
+    )
+  ];
+
+  for (const match of titleMatches) {
     if (results.length >= MAX_RESULTS) {
       break;
     }
 
-    const titleMatch = block.match(
-      /<a[^>]+class=["'][^"']*\bresult__a\b[^"']*["'][^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i
-    );
-
-    const snippetMatch = block.match(
-      /<a[^>]+class=["'][^"']*\bresult__snippet\b[^"']*["'][^>]*>([\s\S]*?)<\/a>/i
-    );
-
-    if (!titleMatch) {
-      continue;
-    }
-
-    const url = normalizeUrl(titleMatch[1]);
-    const title = cleanText(titleMatch[2]);
-    const snippet = cleanText(
-      snippetMatch ? snippetMatch[1] : ""
-    );
+    const url = normalizeUrl(match[1]);
+    const title = cleanText(match[2]);
 
     if (!url || !title) {
       continue;
@@ -174,42 +210,34 @@ async function searchDuckDuckGo(query) {
 
     results.push({
       title,
-      snippet,
+      snippet: "",
       url,
       source: "DuckDuckGo"
     });
   }
 
   /*
-   * Fallback de parsing si la structure des blocs change.
-   * On cherche directement les liens result__a.
+   * Deuxième passage :
+   * recherche de snippets à l'intérieur des résultats.
+   *
+   * On ne crée jamais un résultat supplémentaire
+   * simplement parce qu'un snippet existe.
    */
 
-  if (results.length === 0) {
-    const matches = [
+  if (results.length > 0) {
+    const snippets = [
       ...html.matchAll(
-        /<a[^>]+class=["'][^"']*\bresult__a\b[^"']*["'][^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi
+        /<a[^>]+class=["'][^"']*\bresult__snippet\b[^"']*["'][^>]*>([\s\S]*?)<\/a>/gi
       )
     ];
 
-    for (const match of matches) {
-      if (results.length >= MAX_RESULTS) {
-        break;
-      }
-
-      const url = normalizeUrl(match[1]);
-      const title = cleanText(match[2]);
-
-      if (!url || !title) {
-        continue;
-      }
-
-      results.push({
-        title,
-        snippet: "",
-        url,
-        source: "DuckDuckGo"
-      });
+    for (
+      let i = 0;
+      i < results.length && i < snippets.length;
+      i++
+    ) {
+      results[i].snippet =
+        cleanText(snippets[i][1]);
     }
   }
 
@@ -228,10 +256,17 @@ async function searchDuckDuckGo(query) {
 
 function extractXmlTag(xml, tag) {
   const match = xml.match(
-    new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`, "i")
+    new RegExp(
+      `<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`,
+      "i"
+    )
   );
 
-  return match ? cleanText(match[1]) : "";
+  if (!match) {
+    return "";
+  }
+
+  return cleanText(match[1]);
 }
 
 async function searchGoogleNews(query) {
@@ -242,18 +277,23 @@ async function searchGoogleNews(query) {
     method: "GET",
     headers: {
       "User-Agent": "BerthoAI-Search/1.0",
-      "Accept": "application/rss+xml, application/xml, text/xml"
+      "Accept":
+        "application/rss+xml, application/xml, text/xml"
     }
   });
 
   if (!response.ok) {
-    throw new Error(`Google News HTTP ${response.status}`);
+    throw new Error(
+      `Google News HTTP ${response.status}`
+    );
   }
 
   const xml = await response.text();
 
   if (!xml || !xml.includes("<item")) {
-    throw new Error("Google News returned no RSS items");
+    throw new Error(
+      "Google News returned no RSS items"
+    );
   }
 
   const items =
@@ -268,8 +308,20 @@ async function searchGoogleNews(query) {
 
     const title = extractXmlTag(item, "title");
     const link = extractXmlTag(item, "link");
-    const description = extractXmlTag(item, "description");
-    const source = extractXmlTag(item, "source");
+
+    /*
+     * IMPORTANT :
+     * Le description Google News peut contenir du HTML
+     * encodé dans le XML.
+     *
+     * cleanText() décode d'abord les entités puis
+     * supprime les balises.
+     */
+    const description =
+      extractXmlTag(item, "description");
+
+    const source =
+      extractXmlTag(item, "source");
 
     const url = normalizeUrl(link);
 
@@ -310,7 +362,9 @@ async function searchWikipedia(query) {
   });
 
   if (!response.ok) {
-    throw new Error(`Wikipedia HTTP ${response.status}`);
+    throw new Error(
+      `Wikipedia HTTP ${response.status}`
+    );
   }
 
   const data = await response.json();
@@ -318,7 +372,9 @@ async function searchWikipedia(query) {
   const pages = data?.query?.search;
 
   if (!Array.isArray(pages) || pages.length === 0) {
-    throw new Error("Wikipedia returned no results");
+    throw new Error(
+      "Wikipedia returned no results"
+    );
   }
 
   const results = [];
@@ -340,6 +396,10 @@ async function searchWikipedia(query) {
         page.title.replace(/ /g, "_")
       )}`;
 
+    if (!isValidUrl(url)) {
+      continue;
+    }
+
     results.push({
       title,
       snippet,
@@ -349,14 +409,16 @@ async function searchWikipedia(query) {
   }
 
   if (results.length === 0) {
-    throw new Error("Wikipedia returned no valid results");
+    throw new Error(
+      "Wikipedia returned no valid results"
+    );
   }
 
   return results;
 }
 
 /* ============================================================
-   DEDUPLICATION
+   DÉDUPLICATION
    ============================================================ */
 
 function deduplicateResults(results) {
@@ -364,18 +426,30 @@ function deduplicateResults(results) {
   const unique = [];
 
   for (const result of results) {
-    if (!result?.url || !isValidUrl(result.url)) {
+    if (
+      !result?.url ||
+      !isValidUrl(result.url)
+    ) {
       continue;
     }
 
-    const key = result.url.toLowerCase();
+    const key =
+      result.url.toLowerCase();
 
     if (seen.has(key)) {
       continue;
     }
 
     seen.add(key);
-    unique.push(result);
+
+    unique.push({
+      title: cleanText(result.title),
+      snippet: cleanText(result.snippet),
+      url: result.url,
+      source:
+        cleanText(result.source) ||
+        "Unknown"
+    });
 
     if (unique.length >= MAX_RESULTS) {
       break;
@@ -389,24 +463,46 @@ function deduplicateResults(results) {
    SEARCH ORCHESTRATOR
    ============================================================ */
 
-async function performSearch(query) {
+async function performSearch(
+  query,
+  intent = {}
+) {
+  const newsSearch =
+    isNewsSearch(intent);
+
+  /*
+   * L'ordre dépend de l'intention reçue.
+   *
+   * Recherche d'actualité :
+   *   DuckDuckGo → Google News
+   *
+   * Recherche web générale :
+   *   DuckDuckGo → Google News → Wikipedia
+   */
+
   const attempts = [
     {
       provider: "duckduckgo",
       fallback: false,
-      execute: () => searchDuckDuckGo(query)
+      execute: () =>
+        searchDuckDuckGo(query)
     },
     {
       provider: "google_news_rss",
       fallback: true,
-      execute: () => searchGoogleNews(query)
-    },
-    {
-      provider: "wikipedia",
-      fallback: true,
-      execute: () => searchWikipedia(query)
+      execute: () =>
+        searchGoogleNews(query)
     }
   ];
+
+  if (!newsSearch) {
+    attempts.push({
+      provider: "wikipedia",
+      fallback: true,
+      execute: () =>
+        searchWikipedia(query)
+    });
+  }
 
   const errors = [];
 
@@ -416,9 +512,10 @@ async function performSearch(query) {
         `[Search] Tentative provider: ${attempt.provider}`
       );
 
-      const results = deduplicateResults(
-        await attempt.execute()
-      );
+      const results =
+        deduplicateResults(
+          await attempt.execute()
+        );
 
       if (results.length > 0) {
         return {
@@ -436,12 +533,15 @@ async function performSearch(query) {
     } catch (error) {
       console.warn(
         `[Search] ${attempt.provider} failed:`,
-        error?.message || String(error)
+        error?.message ||
+          String(error)
       );
 
       errors.push({
         provider: attempt.provider,
-        error: error?.message || String(error)
+        error:
+          error?.message ||
+          String(error)
       });
     }
   }
@@ -460,9 +560,13 @@ async function performSearch(query) {
 
 export default {
   async fetch(request, env) {
-    const url = new URL(request.url);
+    const url =
+      new URL(request.url);
 
-    // 1. CORS PREFLIGHT
+    /* --------------------------------
+       CORS PREFLIGHT
+    -------------------------------- */
+
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -470,7 +574,10 @@ export default {
       });
     }
 
-    // 2. HEALTH CHECK
+    /* --------------------------------
+       HEALTH CHECK
+    -------------------------------- */
+
     if (
       request.method === "GET" &&
       url.pathname === "/health"
@@ -481,15 +588,34 @@ export default {
       });
     }
 
-    // 3. SEARCH
+    /* --------------------------------
+       SEARCH
+    -------------------------------- */
+
     if (
       request.method === "POST" &&
-      (url.pathname === "/" || url.pathname === "/search")
+      (
+        url.pathname === "/" ||
+        url.pathname === "/search"
+      )
     ) {
       try {
-        const body = await request.json();
+        const body =
+          await request.json();
 
-        const query = body.query || body.message;
+        /*
+         * Compatibilité avec les anciens tests :
+         *
+         * {
+         *   "query": "..."
+         * }
+         *
+         * fonctionne toujours.
+         */
+
+        const query =
+          body.query ||
+          body.message;
 
         if (
           !query ||
@@ -505,20 +631,57 @@ export default {
           );
         }
 
-        const cleanQuery = query.trim();
+        const cleanQuery =
+          query.trim();
 
-        const search = await performSearch(cleanQuery);
+        /*
+         * L'intention est fournie par
+         * l'orchestrateur.
+         *
+         * En mode Lab, elle peut être
+         * simulée manuellement.
+         */
 
-        if (search.results.length === 0) {
+        const intent =
+          normalizeIntent(body);
+
+        console.log(
+          "[Search] Request:",
+          JSON.stringify({
+            query: cleanQuery,
+            intent
+          })
+        );
+
+        const search =
+          await performSearch(
+            cleanQuery,
+            intent
+          );
+
+        if (
+          search.results.length === 0
+        ) {
           return json(
             {
               success: false,
-              error: "search_unavailable",
+              error: isNewsSearch(intent)
+                ? "news_search_unavailable"
+                : "search_unavailable",
+
               query: cleanQuery,
+
+              intent,
+
               resultsCount: 0,
+
               results: [],
-              providersAttempted: search.errors,
-              timestamp: new Date().toISOString()
+
+              providersAttempted:
+                search.errors,
+
+              timestamp:
+                new Date().toISOString()
             },
             503
           );
@@ -526,18 +689,35 @@ export default {
 
         return json({
           success: true,
+
           query: cleanQuery,
-          provider: search.provider,
-          fallback: search.fallback,
-          resultsCount: search.results.length,
-          results: search.results,
+
+          intent,
+
+          provider:
+            search.provider,
+
+          fallback:
+            search.fallback,
+
+          resultsCount:
+            search.results.length,
+
+          results:
+            search.results,
+
           ...(search.errors.length > 0
             ? {
-                providerWarnings: search.errors
+                providerWarnings:
+                  search.errors
               }
+           
             : {}),
-          timestamp: new Date().toISOString()
+
+          timestamp:
+            new Date().toISOString()
         });
+
       } catch (error) {
         console.error(
           "[Live Search Error]:",
@@ -547,12 +727,18 @@ export default {
         return json(
           {
             success: false,
-            error: error?.message || "search_failed"
+            error:
+              error?.message ||
+              "search_failed"
           },
           500
         );
       }
     }
+
+    /* --------------------------------
+       ROUTE NOT FOUND
+    -------------------------------- */
 
     return json(
       {
